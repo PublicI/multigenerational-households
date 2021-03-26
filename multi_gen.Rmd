@@ -1,0 +1,207 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+ 
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyr)
+
+library(ipumsr)
+library(tidycensus)
+```
+
+Load the IPUMS data and pre-process label values as factors. Create two `is_multi_gen` variables: one with non-adjacent households and one without.
+
+Assign NAs for numeric variables (these are represented as 9999999)
+
+```{r}
+usa_ipums <- read_ipums_micro(
+  read_ipums_ddi('./data/ipums_usa//usa_00012.xml')
+) %>% mutate(
+  PUMA_factor=as_factor(lbl_clean(PUMA)),
+  PUMA=str_pad(PUMA_factor, 5, pad='0'),
+
+  state_name=as_factor(lbl_clean(STATEFIP)),
+  STATEFIP=str_pad(STATEFIP, 2, pad='0'),
+  
+  MULTGEN_fct=as_factor(lbl_clean(MULTGEN)),
+  
+  HISPAN_fct=as_factor(lbl_clean(HISPAN)),
+  RACE_fct=as_factor(lbl_clean(RACE)),
+  RELATE_fct=as_factor(lbl_clean(RELATE)),
+  
+  is_multi_gen=MULTGEND %in% c(22,23,31,32),
+  is_multi_gen_alt=MULTGEND %in% c(22, 31,32),
+  
+  HHINCOME = as.integer(lbl_na_if(HHINCOME, ~ .val >= 9999999)),
+  AGE = as.integer(lbl_na_if(AGE, ~ .val >= 9999999))
+)
+```
+
+```{r}
+puma_county_hh_crosswalk <- read.csv('data/geocorr2018.csv', sep = '\t')  %>%
+  filter(state != 'State code') %>%
+  mutate(afact=as.double(afact))
+```
+
+Calculate household level statistics and also assign multi_gen & ethnicity values. The current approach uses the head-of-household's ethnicity for the entire household.
+
+```{r}
+multi_gen_breakdown <- usa_ipums %>% group_by(
+    state_name,
+    STATEFIP,
+    PUMA,
+    SERIAL
+  ) %>%
+  summarize( # Each row here is one household
+    HHWT = mean(HHWT), # This is the household weight, should be the same for the entire household.
+    hh_size = n(), # Numer of members in the household.
+    is_multi_gen = any(is_multi_gen), # Is the household multi-generational? This value is assigned earlier and should be identical for the entire household.
+    
+    black_hoh = any(RACE_fct == 'Black/African American/Negro' & RELATE_fct == 'Head/Householder'), # The head of household is black.
+    asian_hoh = any(RACE_fct %in% c('Chinese', 'Japanese', 'Other Asian or Pacific Islander') & RELATE_fct == 'Head/Householder'),
+    hispanic_hoh = any((HISPAN_fct != 'Not Hispanic') & (RELATE_fct == 'Head/Householder') & !black_hoh & !asian_hoh), # Exclude black & asian hispanic households from the "hispanic" category.
+    
+    non_white_hoh = any((RACE_fct != 'White' || HISPAN_fct != 'Not Hispanic') & RELATE_fct == 'Head/Householder'),
+    white_hoh = any(RACE_fct == 'White' & HISPAN_fct == 'Not Hispanic' & RELATE_fct == 'Head/Householder'),
+    
+    hispanic_multigen = (is_multi_gen && hispanic_hoh),
+    black_multigen = (is_multi_gen && black_hoh),
+    asian_multigen = (is_multi_gen && asian_hoh),
+    non_white_multigen = (is_multi_gen && non_white_hoh),
+    white_multigen = (is_multi_gen && white_hoh),
+    
+    # new stats
+    median_hh_age = median(AGE, na.rm = TRUE),
+    median_hh_income = median(HHINCOME, na.rm = TRUE)
+  )
+```
+
+Free-up some memory
+
+```{r}
+rm(usa_ipums)
+gc()
+```
+
+```{r}
+calculate_weighted_median <- function(est, weight) {
+  # ensure that at-least one weight is greater than 0
+  if (length(est) == 0 || length(weight) == 0) {
+    return(NA)
+  }
+  else if (length(est) != length(weight)) { 
+    return(NA) 
+  }
+  else {
+    return(median(rep(est, times=weight),  na.rm=TRUE))
+  }
+}
+```
+
+
+```{r}
+puma_multi_gen_stats <- multi_gen_breakdown %>%
+  ungroup() %>%
+  group_by(
+    state_name,
+    STATEFIP,
+    PUMA
+  ) %>% summarise(
+    total_hh=sum(HHWT),
+    total_population=sum(hh_size*HHWT),
+    
+    is_multi_gen = sum(as.integer(is_multi_gen)*HHWT),
+
+    hispanic_hoh = sum(as.integer(hispanic_hoh)*HHWT),
+    black_hoh = sum(as.integer(black_hoh)*HHWT),
+    asian_hoh = sum(as.integer(asian_hoh)*HHWT),
+    non_white_hoh = sum(as.integer(non_white_hoh)*HHWT),
+    white_hoh = sum(as.integer(white_hoh)*HHWT),
+    
+    hispanic_multigen = sum(as.integer(hispanic_multigen)*HHWT),
+    black_multigen = sum(as.integer(black_multigen)*HHWT),
+    asian_multigen = sum(as.integer(asian_multigen)*HHWT),
+    non_white_multigen = sum(as.integer(non_white_multigen)*HHWT),
+    white_multigen = sum(as.integer(white_multigen)*HHWT),
+    
+    median_hh_income = calculate_weighted_median(median_hh_income, HHWT),
+    median_hh_age = median(rep(median_hh_age, times=HHWT))
+  )
+```
+
+```{r}
+
+calculate_group_stats <- function(df) {
+ stats <- df %>% summarise(
+    total_hh = sum(total_hh*afact),
+    total_population = sum(total_population*afact),
+    total_multi_gen = sum(is_multi_gen*afact),
+    
+    total_hispanic = sum(hispanic_hoh*afact),
+    total_black = sum(black_hoh*afact),
+    total_asian = sum(asian_hoh*afact),
+    total_non_white = sum(non_white_hoh*afact),
+    total_white = sum(white_hoh*afact),
+    
+    total_hispanic_multigen = sum(hispanic_multigen*afact),
+    total_black_multigen = sum(black_multigen*afact),
+    total_asian_multigen = sum(asian_multigen*afact),
+    total_non_white_multigen = sum(non_white_multigen*afact),
+    total_white_multigen = sum(white_multigen*afact),
+  ) %>% ungroup() %>% mutate(
+    multi_gen_pct=total_multi_gen/total_hh,
+    hispanic_multigen_pct=total_hispanic_multigen/total_hispanic,
+    black_multigen_pct=total_black_multigen/total_black,
+    asian_multigen_pct=total_asian_multigen/total_asian,
+    non_white_multigen=total_non_white_multigen/total_non_white,
+    white_multigen=total_white_multigen/total_white
+  )
+ 
+ return(stats)
+}
+```
+
+
+```{r}
+data(fips_codes)
+fips_codes <- get("fips_codes") %>% mutate(
+  fips_code = paste(state_code, county_code, sep='')
+)
+```
+
+```{r}
+county_level_stats <- puma_multi_gen_stats %>%
+  left_join(
+    puma_county_hh_crosswalk,
+    by=c(
+      'STATEFIP'='state',
+      'PUMA'='puma12'
+    )
+  ) %>% group_by(
+    state_name,
+    county
+  ) %>% calculate_group_stats()
+
+county_level_stats %>%
+  select(-c(state_name)) %>%
+  rename(
+    fips_code=county
+  ) %>%
+  left_join(fips_codes, by=c('fips_code')) %>%
+  select(-c(state_code, county_code)) %>%
+  select(state, state_name, county, everything()) %>%
+  arrange(desc(multi_gen_pct)) %>% write.csv('./us_multi_gen_county_level_v8.csv')
+```
+
+```{r}
+state_level_stats <- puma_multi_gen_stats %>%
+  mutate(afact=1) %>% group_by(
+    state_name
+  ) %>% calculate_group_stats()
+
+state_level_stats %>% write.csv('./us_multi_gen_stats_state_level_v2.csv')
+```
